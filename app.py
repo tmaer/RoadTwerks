@@ -1,6 +1,10 @@
-
 import asyncio
+import json
 import os
+from datetime import date, timedelta
+from urllib.error import URLError, HTTPError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import altair as alt
 import asyncpg
@@ -15,7 +19,7 @@ load_dotenv()
 
 st.set_page_config(
     page_title="RoadworkWise",
-    page_icon="",
+    page_icon="🚧",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -34,14 +38,17 @@ st.markdown(
 )
 
 st.title("RoadworkWise")
-st.caption("Find quieter times for roadworks using historical traffic data.")
+st.caption(
+    "Forecast traffic demand, check weather conditions "
+    "and find a more efficient time for roadworks."
+)
 
 
 # --------------------------------------------------
 # DATABASE
 # --------------------------------------------------
 
-async def query_database(sql):
+async def query_database(sql, *args):
     conn = await asyncio.wait_for(
         asyncpg.connect(
             user=os.getenv("DB_USER"),
@@ -51,12 +58,13 @@ async def query_database(sql):
             database=os.getenv("DB_NAME", "tsdb"),
             ssl=os.getenv("DB_SSL", "require"),
             timeout=20,
-            command_timeout=60,
+            command_timeout=120,
         ),
         timeout=25,
     )
+
     try:
-        return await conn.fetch(sql, timeout=60)
+        return await conn.fetch(sql, *args, timeout=120)
     finally:
         await conn.close()
 
@@ -64,11 +72,12 @@ async def query_database(sql):
 @st.cache_data(ttl=300, show_spinner=False)
 def load_sensors():
     rows = asyncio.run(query_database("""
-        SELECT id AS sensor_id,
-               name AS sensor_name,
-               district,
-               latitude,
-               longitude
+        SELECT
+            id AS sensor_id,
+            name AS "Name",
+            district,
+            latitude AS "Latitude",
+            longitude AS "Longitude"
         FROM public.detectors
         WHERE latitude IS NOT NULL
           AND longitude IS NOT NULL
@@ -78,8 +87,11 @@ def load_sensors():
     return pd.DataFrame(
         [dict(row) for row in rows],
         columns=[
-            "sensor_id", "sensor_name", "district",
-            "latitude", "longitude",
+            "sensor_id",
+            "Name",
+            "district",
+            "Latitude",
+            "Longitude",
         ],
     )
 
@@ -87,48 +99,56 @@ def load_sensors():
 @st.cache_data(ttl=300, show_spinner=False)
 def load_traffic():
     rows = asyncio.run(query_database("""
-        SELECT date AS reading_time,
-               id AS sensor_id,
-               vehicles
+        SELECT
+            date AS "Hour",
+            id AS sensor_id,
+            vehicles AS "Vehicle Count"
         FROM public.traffic
         WHERE date IS NOT NULL
           AND vehicles IS NOT NULL
-        ORDER BY date DESC
-        LIMIT 100000
+        ORDER BY id, date
     """))
 
     df = pd.DataFrame(
         [dict(row) for row in rows],
-        columns=["reading_time", "sensor_id", "vehicles"],
+        columns=["Hour", "sensor_id", "Vehicle Count"],
     )
 
     if not df.empty:
-        df["reading_time"] = pd.to_datetime(
-            df["reading_time"], errors="coerce"
+        df["Hour"] = pd.to_datetime(
+            df["Hour"], errors="coerce"
         )
-        df["vehicles"] = pd.to_numeric(
-            df["vehicles"], errors="coerce"
+        df["Vehicle Count"] = pd.to_numeric(
+            df["Vehicle Count"], errors="coerce"
         )
         df["sensor_id"] = pd.to_numeric(
             df["sensor_id"], errors="coerce"
         )
+
         df = df.dropna(
-            subset=["reading_time", "vehicles", "sensor_id"]
+            subset=["Hour", "Vehicle Count", "sensor_id"]
         ).copy()
+
         df["sensor_id"] = df["sensor_id"].astype(int)
 
     return df
 
 
 try:
-    with st.spinner("Loading camera locations and traffic history..."):
+    with st.spinner(
+        "Loading camera locations and historical traffic data..."
+    ):
         sensors = load_sensors()
         traffic = load_traffic()
+
 except Exception as exc:
-    st.error("Could not connect to the traffic database.")
+    st.error("Could not load data from the traffic database.")
+
     with st.expander("Technical details"):
         st.code(str(exc))
+
     st.stop()
+
 
 if sensors.empty:
     st.error("No cameras with valid coordinates were found.")
@@ -137,15 +157,17 @@ if sensors.empty:
 sensors["sensor_id"] = pd.to_numeric(
     sensors["sensor_id"], errors="coerce"
 )
-sensors["latitude"] = pd.to_numeric(
-    sensors["latitude"], errors="coerce"
+sensors["Latitude"] = pd.to_numeric(
+    sensors["Latitude"], errors="coerce"
 )
-sensors["longitude"] = pd.to_numeric(
-    sensors["longitude"], errors="coerce"
+sensors["Longitude"] = pd.to_numeric(
+    sensors["Longitude"], errors="coerce"
 )
+
 sensors = sensors.dropna(
-    subset=["sensor_id", "latitude", "longitude"]
+    subset=["sensor_id", "Latitude", "Longitude"]
 ).copy()
+
 sensors["sensor_id"] = sensors["sensor_id"].astype(int)
 
 if traffic.empty:
@@ -158,14 +180,16 @@ if traffic.empty:
 # --------------------------------------------------
 
 st.subheader("Traffic camera map")
+
 st.write(
-    "Click a camera marker to select it, or use the dropdown below."
+    "Click a camera marker to select it, "
+    "or search for a camera using the dropdown."
 )
 
 traffic_map = folium.Map(
     location=[
-        float(sensors["latitude"].mean()),
-        float(sensors["longitude"].mean()),
+        float(sensors["Latitude"].mean()),
+        float(sensors["Longitude"].mean()),
     ],
     zoom_start=11,
     tiles="OpenStreetMap",
@@ -177,13 +201,17 @@ cluster = MarkerCluster(
     options={"showCoverageOnHover": False},
 ).add_to(traffic_map)
 
-for row in sensors.itertuples(index=False):
-    sid = int(row.sensor_id)
-    name = str(row.sensor_name or f"Camera {sid}")
-    district = str(row.district or "Unknown")
+for _, row in sensors.iterrows():
+    sid = int(row["sensor_id"])
+
+    name = str(row["Name"] or f"Camera {sid}")
+    district = str(row["district"] or "Unknown")
 
     folium.Marker(
-        location=[float(row.latitude), float(row.longitude)],
+        location=[
+            float(row["Latitude"]),
+            float(row["Longitude"]),
+        ],
         tooltip=f"Camera ID: {sid}",
         popup=folium.Popup(
             f"<b>{name}</b><br>"
@@ -192,7 +220,9 @@ for row in sensors.itertuples(index=False):
             max_width=280,
         ),
         icon=folium.Icon(
-            color="blue", icon="camera", prefix="fa"
+            color="blue",
+            icon="camera",
+            prefix="fa",
         ),
     ).add_to(cluster)
 
@@ -207,34 +237,41 @@ map_result = st_folium(
 if "selected_camera" not in st.session_state:
     st.session_state["selected_camera"] = None
 
-# Use the clicked marker tooltip when Streamlit returns it.
-tooltip = (map_result or {}).get("last_object_clicked_tooltip")
+tooltip = (map_result or {}).get(
+    "last_object_clicked_tooltip"
+)
 
 if tooltip and "Camera ID:" in str(tooltip):
     try:
         clicked_id = int(
             str(tooltip).split("Camera ID:")[-1].strip()
         )
+
         if clicked_id in set(sensors["sensor_id"]):
             st.session_state["selected_camera"] = clicked_id
+
     except (ValueError, TypeError):
         pass
 
-# Searchable fallback selector.
+
 sensor_options = {}
-for row in sensors.itertuples(index=False):
-    sid = int(row.sensor_id)
-    name = str(row.sensor_name or f"Camera {sid}")
-    district = str(row.district or "Unknown")
-    label = f"{name} | ID {sid} | {district}"
-    sensor_options[label] = sid
+
+for _, row in sensors.iterrows():
+    sid = int(row["sensor_id"])
+    name = str(row["Name"] or f"Camera {sid}")
+    district = str(row["district"] or "Unknown")
+
+    sensor_options[
+        f"{name} | ID {sid} | {district}"
+    ] = sid
 
 labels = list(sensor_options.keys())
 current_id = st.session_state["selected_camera"]
 
 default_index = next(
     (
-        i for i, label in enumerate(labels)
+        i
+        for i, label in enumerate(labels)
         if sensor_options[label] == current_id
     ),
     None,
@@ -249,12 +286,14 @@ chosen_label = st.selectbox(
 )
 
 if chosen_label:
-    st.session_state["selected_camera"] = sensor_options[chosen_label]
+    st.session_state["selected_camera"] = (
+        sensor_options[chosen_label]
+    )
 
 selected_id = st.session_state["selected_camera"]
 
 if selected_id is None:
-    st.info("Choose a camera above to display its traffic graph.")
+    st.info("Choose a camera to display its traffic data.")
     st.stop()
 
 
@@ -277,45 +316,65 @@ camera_data = traffic.loc[
 ].copy()
 
 st.divider()
-st.subheader(f"📍 {camera['sensor_name'] or f'Camera {selected_id}'}")
+
+st.subheader(
+    f"📍 {camera['Name'] or f'Camera {selected_id}'}"
+)
 
 st.caption(
-    f"Camera ID: {selected_id}  |  "
-    f"District: {camera['district'] or 'Unknown'}  |  "
-    f"Latitude: {float(camera['latitude']):.6f}  |  "
-    f"Longitude: {float(camera['longitude']):.6f}"
+    f"Camera ID: {selected_id} | "
+    f"District: {camera['district'] or 'Unknown'} | "
+    f"Latitude: {float(camera['Latitude']):.6f} | "
+    f"Longitude: {float(camera['Longitude']):.6f}"
 )
 
 if camera_data.empty:
     st.warning(
-        "No historical readings were found for this camera "
-        "in the loaded dataset."
+        "No historical readings were found for this camera."
     )
     st.stop()
 
-camera_data["minute"] = (
-    camera_data["reading_time"].dt.hour * 60
-    + camera_data["reading_time"].dt.minute
+st.caption(
+    f"Historical coverage: "
+    f"{camera_data['Hour'].min()} to "
+    f"{camera_data['Hour'].max()} "
+    f"({len(camera_data):,} readings)"
 )
+
+camera_data["minute"] = (
+    camera_data["Hour"].dt.hour * 60
+    + camera_data["Hour"].dt.minute
+)
+
 camera_data["slot"] = (
     camera_data["minute"] // 15
 ) * 15
 
 
 # --------------------------------------------------
-# 24-HOUR AVERAGE TRAFFIC GRAPH
+# HISTORICAL TRAFFIC GRAPH
 # --------------------------------------------------
 
 daily = (
     camera_data.groupby("slot", as_index=False)
     .agg(
-        average_vehicles=("vehicles", "mean"),
-        reading_count=("vehicles", "count"),
+        average_vehicles=("Vehicle Count", "mean"),
+        reading_count=("Vehicle Count", "count"),
         distinct_days=(
-            "reading_time",
+            "Hour",
             lambda values: values.dt.date.nunique(),
         ),
     )
+)
+
+all_slots = pd.DataFrame({
+    "slot": list(range(0, 1440, 15))
+})
+
+daily = all_slots.merge(
+    daily,
+    on="slot",
+    how="left",
 )
 
 daily["time"] = daily["slot"].apply(
@@ -325,10 +384,11 @@ daily["time"] = daily["slot"].apply(
     )
 )
 
-st.subheader("Average traffic across 24 hours")
+st.subheader("Historical traffic patterns")
+
 st.write(
-    "Each point shows the average recorded vehicle count for that "
-    "15-minute time slot across the available historical readings."
+    "Explore the average recorded vehicle count for each "
+    "15-minute period across the available historical data."
 )
 
 chart = (
@@ -342,7 +402,10 @@ chart = (
         x=alt.X(
             "slot:Q",
             title="Time of day",
-            scale=alt.Scale(domain=[0, 1440]),
+            scale=alt.Scale(
+                domain=[0, 1440],
+                nice=False,
+            ),
             axis=alt.Axis(
                 values=list(range(0, 1441, 120)),
                 labelExpr=(
@@ -364,8 +427,14 @@ chart = (
                 title="Average vehicles",
                 format=".2f",
             ),
-            alt.Tooltip("reading_count:Q", title="Readings"),
-            alt.Tooltip("distinct_days:Q", title="Days represented"),
+            alt.Tooltip(
+                "reading_count:Q",
+                title="Readings",
+            ),
+            alt.Tooltip(
+                "distinct_days:Q",
+                title="Days represented",
+            ),
         ],
     )
     .properties(height=350)
@@ -376,28 +445,237 @@ st.altair_chart(chart, use_container_width=True)
 
 with st.expander("How to read this graph"):
     st.write(
-        "Lower points indicate fewer vehicles recorded on average "
-        "during that time slot. Hover over a point to see its average, "
-        "number of readings and number of dates represented."
+        "Lower points indicate fewer vehicles recorded on "
+        "average during that time slot."
     )
     st.write(
-        "This is based on the available historical records, not live "
-        "traffic or a direct measurement of journey delays."
+        "Blank sections mean no readings were available "
+        "for those time slots. This graph shows historical "
+        "data, not live traffic."
     )
 
 
 # --------------------------------------------------
-# ROADWORKS DURATION AND BEST TIME
+# WEATHER API
+# --------------------------------------------------
+
+def fetch_weather_forecast(latitude, longitude, planned_date):
+    """
+    Retrieve hourly weather data from Open-Meteo.
+
+    Forecast availability depends on the selected date.
+    """
+
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "hourly": (
+            "temperature_2m,"
+            "precipitation_probability,"
+            "precipitation,"
+            "wind_speed_10m"
+        ),
+        "timezone": "auto",
+        "start_date": planned_date.isoformat(),
+        "end_date": planned_date.isoformat(),
+    }
+
+    url = (
+        "https://api.open-meteo.com/v1/forecast?"
+        + urlencode(params)
+    )
+
+    request = Request(
+        url,
+        headers={"User-Agent": "RoadworkWise/1.0"},
+    )
+
+    with urlopen(request, timeout=15) as response:
+        payload = json.loads(
+            response.read().decode("utf-8")
+        )
+
+    hourly = payload.get("hourly")
+
+    if not hourly or not hourly.get("time"):
+        raise ValueError(
+            "The weather API returned no hourly forecast "
+            "for this date."
+        )
+
+    weather = pd.DataFrame({
+        "time": pd.to_datetime(hourly["time"]),
+        "temperature_2m": hourly.get(
+            "temperature_2m"
+        ),
+        "precipitation_probability": hourly.get(
+            "precipitation_probability"
+        ),
+        "precipitation": hourly.get(
+            "precipitation"
+        ),
+        "wind_speed_10m": hourly.get(
+            "wind_speed_10m"
+        ),
+    })
+
+    return weather
+
+
+def weather_for_window(weather, start_minute, end_minute):
+    """
+    Average hourly weather values overlapping a work window.
+    Weather is hourly, so this is an approximation.
+    """
+
+    if weather is None or weather.empty:
+        return None
+
+    weather = weather.copy()
+
+    weather["minute"] = (
+        weather["time"].dt.hour * 60
+        + weather["time"].dt.minute
+    )
+
+    # Include hourly observations inside the candidate window.
+    selected = weather[
+        (weather["minute"] >= start_minute)
+        & (weather["minute"] < end_minute)
+    ]
+
+    # If the window is short and contains no hourly timestamp,
+    # use the closest available hourly forecast.
+    if selected.empty:
+        midpoint = (start_minute + end_minute) / 2
+
+        weather["distance"] = (
+            weather["minute"] - midpoint
+        ).abs()
+
+        selected = weather.nsmallest(1, "distance")
+
+    result = {}
+
+    for column, output_name in [
+        ("temperature_2m", "temperature"),
+        (
+            "precipitation_probability",
+            "rain_probability",
+        ),
+        ("precipitation", "precipitation"),
+        ("wind_speed_10m", "wind_speed"),
+    ]:
+        if column in selected.columns:
+            values = pd.to_numeric(
+                selected[column],
+                errors="coerce",
+            ).dropna()
+
+            result[output_name] = (
+                float(values.mean())
+                if not values.empty
+                else None
+            )
+
+    return result
+
+
+def weather_risk(summary):
+    """
+    A transparent heuristic indicator, not a safety prediction.
+    Higher values indicate less favourable weather conditions.
+    """
+
+    if not summary:
+        return None
+
+    score = 0.0
+    used = False
+
+    rain_probability = summary.get("rain_probability")
+    precipitation = summary.get("precipitation")
+    wind_speed = summary.get("wind_speed")
+
+    if rain_probability is not None:
+        score += 0.5 * max(
+            0,
+            min(100, rain_probability),
+        )
+        used = True
+
+    if precipitation is not None:
+        score += 10 * max(
+            0,
+            min(3, precipitation),
+        )
+        used = True
+
+    if wind_speed is not None:
+        score += 0.5 * max(
+            0,
+            min(40, wind_speed),
+        )
+        used = True
+
+    return min(100.0, score) if used else None
+
+
+def weather_description(summary):
+    if not summary:
+        return "Weather unavailable"
+
+    bits = []
+
+    if summary.get("temperature") is not None:
+        bits.append(
+            f"{summary['temperature']:.0f}°C"
+        )
+
+    if summary.get("rain_probability") is not None:
+        bits.append(
+            f"{summary['rain_probability']:.0f}% rain chance"
+        )
+
+    if summary.get("precipitation") is not None:
+        bits.append(
+            f"{summary['precipitation']:.1f} mm rain"
+        )
+
+    if summary.get("wind_speed") is not None:
+        bits.append(
+            f"wind {summary['wind_speed']:.0f} km/h"
+        )
+
+    return (
+        " · ".join(bits)
+        if bits
+        else "Weather details unavailable"
+    )
+
+
+# --------------------------------------------------
+# ROADWORKS PLANNING FORM
 # --------------------------------------------------
 
 st.divider()
-st.subheader("When should you carry out roadworks?")
+
+st.subheader("Plan your roadworks")
+
 st.write(
-    "Choose the required duration and permitted working hours. "
-    "RoadworkWise will rank time windows by historical traffic levels."
+    "Choose a date, duration and permitted working hours. "
+    "RoadworkWise estimates traffic demand from historical "
+    "patterns and checks the weather forecast before ranking "
+    "possible work windows."
 )
 
 with st.form("roadworks_schedule"):
+    planned_date = st.date_input(
+        "Planned roadworks date",
+        value=date.today() + timedelta(days=1),
+        min_value=date.today(),
+    )
+
     duration_hours = st.selectbox(
         "Roadworks duration",
         options=[0.5, 1, 1.5, 2, 3, 4, 6, 8, 12],
@@ -428,13 +706,20 @@ with st.form("roadworks_schedule"):
     day_choice = st.selectbox(
         "Day of week",
         [
-            "Any day", "Monday", "Tuesday", "Wednesday",
-            "Thursday", "Friday", "Saturday", "Sunday",
+            "Use selected date",
+            "Any matching weekday",
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+            "Sunday",
         ],
     )
 
     find_best = st.form_submit_button(
-        "Find the best time",
+        "Forecast demand and find the best time",
         type="primary",
         use_container_width=True,
     )
@@ -445,8 +730,15 @@ def minute_of_day(value):
 
 
 def format_time(value):
-    return f"{int(value // 60):02d}:{int(value % 60):02d}"
+    return (
+        f"{int(value // 60):02d}:"
+        f"{int(value % 60):02d}"
+    )
 
+
+# --------------------------------------------------
+# FORECAST AND RANK RECOMMENDATIONS
+# --------------------------------------------------
 
 if find_best:
     earliest_min = minute_of_day(earliest)
@@ -455,83 +747,212 @@ if find_best:
 
     if finish_min <= earliest_min:
         st.error(
-            "The finish time must be later than the earliest start time."
+            "The finish time must be later than "
+            "the earliest start time."
         )
         st.stop()
 
     if earliest_min + duration_min > finish_min:
         st.error(
-            "The roadworks duration does not fit in the permitted time range."
+            "The roadworks duration does not fit "
+            "in the permitted time range."
         )
         st.stop()
 
-    data = camera_data.copy()
+    if planned_date < date.today():
+        st.error("Please select today or a future date.")
+        st.stop()
 
-    if day_choice != "Any day":
-        weekday_num = [
-            "Monday", "Tuesday", "Wednesday", "Thursday",
-            "Friday", "Saturday", "Sunday",
+    # Select historical data matching the target weekday.
+    if day_choice == "Use selected date":
+        target_weekday = planned_date.weekday()
+
+    elif day_choice == "Any matching weekday":
+        target_weekday = None
+
+    else:
+        target_weekday = [
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+            "Sunday",
         ].index(day_choice)
 
+    data = camera_data.copy()
+
+    if target_weekday is not None:
         data = data[
-            data["reading_time"].dt.dayofweek == weekday_num
+            data["Hour"].dt.dayofweek == target_weekday
         ].copy()
 
     if data.empty:
         st.warning(
-            "There are no historical readings for that day of the week."
+            "There are no historical readings for the "
+            "selected weekday. Try another date or weekday."
         )
         st.stop()
 
-    data["date_only"] = data["reading_time"].dt.date
+    data["date_only"] = data["Hour"].dt.date
+
     data["minute"] = (
-        data["reading_time"].dt.hour * 60
-        + data["reading_time"].dt.minute
+        data["Hour"].dt.hour * 60
+        + data["Hour"].dt.minute
     )
-    data["slot"] = (data["minute"] // 15) * 15
 
-    # First average readings within each date and 15-minute slot.
+    data["slot"] = (
+        data["minute"] // 15
+    ) * 15
+
+    # Average each day's readings first, then average across days.
     by_day = (
-        data.groupby(["date_only", "slot"], as_index=False)
-        .agg(vehicles=("vehicles", "mean"))
+        data.groupby(
+            ["date_only", "slot"],
+            as_index=False,
+        )
+        .agg(
+            vehicles=("Vehicle Count", "mean")
+        )
     )
 
-    # Then average each slot across dates.
-    profile = by_day.groupby("slot")["vehicles"].mean()
+    profile = (
+        by_day.groupby("slot")["vehicles"]
+        .mean()
+    )
+
+    sample_days = int(
+        data["date_only"].nunique()
+    )
+
+    # Fetch weather for the selected camera coordinates.
+    weather = None
+    weather_error = None
+
+    with st.spinner(
+        "Fetching the hourly weather forecast..."
+    ):
+        try:
+            weather = fetch_weather_forecast(
+                float(camera["Latitude"]),
+                float(camera["Longitude"]),
+                planned_date,
+            )
+
+        except (
+            URLError,
+            HTTPError,
+            TimeoutError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            weather_error = str(exc)
+
+        except Exception as exc:
+            weather_error = str(exc)
 
     candidates = []
     last_start = finish_min - duration_min
 
-    for start in range(earliest_min, last_start + 1, 15):
+    for start in range(
+        earliest_min,
+        last_start + 1,
+        15,
+    ):
         end = start + duration_min
 
-        # Include all 15-minute slots touched by the work window.
         first_slot = (start // 15) * 15
         last_slot = ((end - 1) // 15) * 15
-        slots = list(range(first_slot, last_slot + 1, 15))
 
-        if not slots or not all(slot in profile.index for slot in slots):
+        slots = list(
+            range(
+                first_slot,
+                last_slot + 1,
+                15,
+            )
+        )
+
+        if not slots:
+            continue
+
+        # Do not silently invent traffic for missing slots.
+        if not all(slot in profile.index for slot in slots):
             continue
 
         values = profile.loc[slots]
 
+        # This is the mean recorded count per 15-minute slot.
+        demand = float(values.mean())
+
+        wx = weather_for_window(
+            weather,
+            start,
+            end,
+        )
+
+        wx_risk = weather_risk(wx)
+
         candidates.append({
             "start": start,
             "end": end,
-            "average_vehicles": float(values.mean()),
+            "average_vehicles": demand,
             "slots_covered": len(values),
+            "weather": wx,
+            "weather_risk": wx_risk,
         })
 
     if not candidates:
         st.warning(
-            "There is not enough historical coverage for this duration "
-            "and time range. Try a shorter duration or a wider time range."
+            "There is not enough historical coverage for "
+            "this duration and time range. Try a shorter "
+            "duration or a wider time range."
         )
         st.stop()
 
+    # --------------------------------------------------
+    # RANK CANDIDATE WINDOWS
+    # --------------------------------------------------
+
+    demands = [
+        item["average_vehicles"]
+        for item in candidates
+    ]
+
+    low_demand = min(demands)
+    high_demand = max(demands)
+
+    for item in candidates:
+        if high_demand > low_demand:
+            item["demand_score"] = (
+                100
+                * (
+                    item["average_vehicles"]
+                    - low_demand
+                )
+                / (
+                    high_demand
+                    - low_demand
+                )
+            )
+        else:
+            item["demand_score"] = 0.0
+
+        # Traffic demand is the main factor.
+        # Weather is a secondary heuristic where available.
+        if item["weather_risk"] is not None:
+            item["combined_score"] = (
+                0.8 * item["demand_score"]
+                + 0.2 * item["weather_risk"]
+            )
+        else:
+            item["combined_score"] = (
+                item["demand_score"]
+            )
+
     ranked = sorted(
         candidates,
-        key=lambda item: item["average_vehicles"],
+        key=lambda item: item["combined_score"],
     )
 
     # Choose up to three non-overlapping alternatives.
@@ -550,13 +971,102 @@ if find_best:
         if len(recommendations) == 3:
             break
 
+    # --------------------------------------------------
+    # SHOW RECOMMENDATIONS
+    # --------------------------------------------------
+
+    st.divider()
     st.subheader("Recommended roadworks times")
-    st.success(
-        "These options are ranked by the lowest average historical "
-        "vehicle count across the selected time window."
+
+    if day_choice == "Any matching weekday":
+        date_description = (
+            "matching weekdays in the historical data"
+        )
+    else:
+        date_description = planned_date.strftime(
+            "%A %d %B %Y"
+        )
+
+    st.caption(
+        f"Demand estimate for {date_description}, based "
+        f"on historical readings from {sample_days} "
+        f"distinct day(s)."
     )
 
-    for rank, item in enumerate(recommendations, start=1):
+    if weather is not None:
+        st.success(
+            "Recommendations combine estimated traffic "
+            "demand (80%) and a weather planning indicator (20%)."
+        )
+
+        st.caption(
+            "The weather weighting is a configurable heuristic, "
+            "not a validated prediction of roadwork safety "
+            "or traffic impact."
+        )
+
+        st.caption(
+            "Weather source: Open-Meteo hourly forecast."
+        )
+
+    else:
+        st.warning(
+            "Weather data could not be retrieved. "
+            "Recommendations use historical demand only."
+        )
+
+        if weather_error:
+            with st.expander("Weather API details"):
+                st.code(weather_error)
+
+    # --------------------------------------------------
+    # WEATHER FORECAST TABLE
+    # --------------------------------------------------
+
+    if weather is not None:
+        st.markdown("### Weather forecast for the planned date")
+
+        display_weather = weather.copy()
+
+        display_weather["Time"] = (
+            display_weather["time"].dt.strftime("%H:%M")
+        )
+
+        display_weather = display_weather.rename(
+            columns={
+                "temperature_2m": "Temperature (°C)",
+                "precipitation_probability": "Rain chance (%)",
+                "precipitation": "Rain (mm)",
+                "wind_speed_10m": "Wind (km/h)",
+            }
+        )
+
+        display_cols = [
+            column
+            for column in [
+                "Time",
+                "Temperature (°C)",
+                "Rain chance (%)",
+                "Rain (mm)",
+                "Wind (km/h)",
+            ]
+            if column in display_weather.columns
+        ]
+
+        st.dataframe(
+            display_weather[display_cols],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    # --------------------------------------------------
+    # TOP THREE OPTIONS
+    # --------------------------------------------------
+
+    for rank, item in enumerate(
+        recommendations,
+        start=1,
+    ):
         with st.container(border=True):
             left, right = st.columns([3, 1])
 
@@ -565,40 +1075,155 @@ if find_best:
                 f"{format_time(item['start'])}–"
                 f"{format_time(item['end'])}"
             )
+
             left.caption(
-                "Estimated historical traffic during the work window"
+                "Estimated average recorded vehicle count "
+                "per 15-minute slot"
             )
 
             right.metric(
-                "Average count per slot",
+                "Demand estimate",
                 f"{item['average_vehicles']:.1f}",
             )
 
-    result_df = pd.DataFrame(recommendations)
+            if item["weather"]:
+                st.write(
+                    "**Forecast conditions:** "
+                    + weather_description(item["weather"])
+                )
 
-    if not result_df.empty:
-        result_df["start_time"] = result_df["start"].apply(format_time)
-        result_df["finish_time"] = result_df["end"].apply(format_time)
-        result_df["camera_id"] = selected_id
-        result_df["camera_name"] = str(camera["sensor_name"])
-        result_df["duration_hours"] = duration_hours
-        result_df["day_choice"] = day_choice
+                if item["weather_risk"] is not None:
+                    st.caption(
+                        "Weather planning indicator: "
+                        f"{item['weather_risk']:.0f}/100 "
+                        "(lower is more favourable)."
+                    )
 
-        st.download_button(
-            "Download recommendations",
-            data=result_df.to_csv(index=False),
-            file_name=f"roadworkwise_camera_{selected_id}.csv",
-            mime="text/csv",
+            if rank == 1:
+                st.info(
+                    "Best-ranked option under the current "
+                    "demand and weather scoring assumptions. "
+                    "Check local restrictions and work-specific "
+                    "weather requirements before confirming."
+                )
+
+    # --------------------------------------------------
+    # COMPARE ALL CANDIDATE WINDOWS
+    # --------------------------------------------------
+
+    st.markdown("### Demand across possible work windows")
+
+    plot_data = pd.DataFrame(candidates)
+
+    plot_data["Window"] = plot_data.apply(
+        lambda row: (
+            f"{format_time(row['start'])}–"
+            f"{format_time(row['end'])}"
+        ),
+        axis=1,
+    )
+
+    plot_data = plot_data.sort_values("start")
+
+    demand_chart = (
+        alt.Chart(plot_data)
+        .mark_bar(color="#2878B5")
+        .encode(
+            x=alt.X(
+                "Window:N",
+                sort=None,
+                title="Candidate work window",
+                axis=alt.Axis(labelAngle=-45),
+            ),
+            y=alt.Y(
+                "average_vehicles:Q",
+                title=(
+                    "Estimated average vehicles "
+                    "per 15-minute slot"
+                ),
+                scale=alt.Scale(zero=True),
+            ),
+            tooltip=[
+                alt.Tooltip(
+                    "Window:N",
+                    title="Window",
+                ),
+                alt.Tooltip(
+                    "average_vehicles:Q",
+                    title="Estimated average vehicles",
+                    format=".1f",
+                ),
+                alt.Tooltip(
+                    "combined_score:Q",
+                    title="Ranking score",
+                    format=".1f",
+                ),
+            ],
         )
+        .properties(height=260)
+    )
+
+    st.altair_chart(
+        demand_chart,
+        use_container_width=True,
+    )
+
+    # --------------------------------------------------
+    # DOWNLOAD RESULTS
+    # --------------------------------------------------
+
+    result_df = pd.DataFrame([
+        {
+            "rank": rank,
+            "planned_date": planned_date.isoformat(),
+            "start_time": format_time(item["start"]),
+            "finish_time": format_time(item["end"]),
+            "duration_hours": duration_hours,
+            "camera_id": selected_id,
+            "camera_name": str(camera["Name"]),
+            "estimated_average_vehicles_per_15min_slot": (
+                item["average_vehicles"]
+            ),
+            "weather_summary": weather_description(
+                item["weather"]
+            ),
+            "weather_risk_indicator_0_100": (
+                item["weather_risk"]
+            ),
+            "ranking_score_lower_is_better": (
+                item["combined_score"]
+            ),
+        }
+        for rank, item in enumerate(
+            recommendations,
+            start=1,
+        )
+    ])
+
+    st.download_button(
+        "Download recommendations",
+        data=result_df.to_csv(index=False),
+        file_name=(
+            f"roadworkwise_camera_{selected_id}_"
+            f"{planned_date.isoformat()}.csv"
+        ),
+        mime="text/csv",
+    )
 
 
 # --------------------------------------------------
 # DISCLAIMER
 # --------------------------------------------------
 
+st.divider()
+
 st.caption(
-    "Recommendations use historical vehicle counts from the most recent "
-    "100,000 database readings loaded by the app. They do not measure live "
-    "traffic, queue length or actual delays. Check road restrictions and "
-    "current conditions before scheduling work."
+    "Traffic demand is estimated from historical readings "
+    "for matching weekdays. This is a baseline estimate, "
+    "not a trained machine-learning forecast or live traffic "
+    "prediction. Weather is retrieved from Open-Meteo and "
+    "used as a planning heuristic, not as a validated measure "
+    "of safety or delay. Recommendations do not measure queue "
+    "length or actual delays. Check road restrictions and "
+    "work-specific weather requirements before scheduling."
 )
