@@ -1,12 +1,19 @@
 
-import os
 import asyncio
+import os
 from datetime import time
 
 import asyncpg
+import folium
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
+from folium.plugins import MarkerCluster
+from streamlit_folium import st_folium
+
+# --------------------------------------------------
+# PAGE SETUP
+# --------------------------------------------------
 
 load_dotenv()
 
@@ -17,16 +24,16 @@ st.set_page_config(
 )
 
 st.title("🚧 RoadworkWise")
-st.write(
-    "Find quieter historical traffic windows for planned roadworks."
+st.caption(
+    "Find quieter times to carry out roadworks using historical "
+    "traffic sensor data."
 )
 
-
 # --------------------------------------------------
-# DATABASE CONNECTION
+# DATABASE
 # --------------------------------------------------
 
-async def query_database(sql, *args):
+async def query_database(sql):
     conn = await asyncio.wait_for(
         asyncpg.connect(
             user=os.getenv("DB_USER"),
@@ -35,395 +42,606 @@ async def query_database(sql, *args):
             port=int(os.getenv("DB_PORT", "30650")),
             database=os.getenv("DB_NAME", "tsdb"),
             ssl=os.getenv("DB_SSL", "require"),
-            timeout=15,
-            command_timeout=45,
+            timeout=20,
+            command_timeout=60,
         ),
-        timeout=20,
+        timeout=25,
     )
 
     try:
-        return await conn.fetch(sql, *args, timeout=45)
+        return await conn.fetch(sql, timeout=60)
     finally:
         await conn.close()
 
 
-# --------------------------------------------------
-# LOAD TRAFFIC DATA
-# --------------------------------------------------
-
 @st.cache_data(ttl=300, show_spinner=False)
-def load_traffic_data():
-    sql = """
-        SELECT
-            t.date AS reading_time,
-            t.id AS sensor_id,
-            d.name AS sensor_name,
-            d.district AS district,
-            d.latitude AS latitude,
-            d.longitude AS longitude,
-            t.vehicles AS vehicles,
-            t.intensity AS intensity,
-            t.occupancy AS occupancy,
-            t.load AS traffic_load
-        FROM public.traffic AS t
-        JOIN public.detectors AS d
-            ON t.id = d.id
-        WHERE t.date IS NOT NULL
-          AND t.vehicles IS NOT NULL
-        ORDER BY t.date DESC
-        LIMIT 100000
-    """
-
-    rows = asyncio.run(query_database(sql))
+def load_sensors():
+    rows = asyncio.run(
+        query_database("""
+            SELECT
+                id AS sensor_id,
+                name AS sensor_name,
+                district,
+                latitude,
+                longitude
+            FROM public.detectors
+            WHERE latitude IS NOT NULL
+              AND longitude IS NOT NULL
+            ORDER BY id
+        """)
+    )
     return pd.DataFrame([dict(row) for row in rows])
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_traffic():
+    rows = asyncio.run(
+        query_database("""
+            SELECT
+                date AS reading_time,
+                id AS sensor_id,
+                vehicles,
+                intensity,
+                occupancy,
+                load AS traffic_load
+            FROM public.traffic
+            WHERE date IS NOT NULL
+              AND vehicles IS NOT NULL
+            ORDER BY date DESC
+            LIMIT 100000
+        """)
+    )
+
+    df = pd.DataFrame([dict(row) for row in rows])
+
+    if not df.empty:
+        df["reading_time"] = pd.to_datetime(
+            df["reading_time"], errors="coerce"
+        )
+        df["vehicles"] = pd.to_numeric(
+            df["vehicles"], errors="coerce"
+        )
+        df = df.dropna(
+            subset=["reading_time", "sensor_id", "vehicles"]
+        )
+
+    return df
+
+
 # --------------------------------------------------
-# SIDEBAR SETTINGS
+# LOAD DATA
 # --------------------------------------------------
 
 with st.sidebar:
-    st.header("Roadworks settings")
+    st.header("Settings")
+    st.write("Data source: TigerData")
 
-    if st.button("Refresh data from database"):
+    if st.button("Refresh database data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
-    duration = st.selectbox(
-        "Roadworks duration",
-        [30, 60, 90, 120, 180, 240, 360],
-        index=1,
-        format_func=lambda x: f"{x} minutes",
-    )
-
-    earliest_start = st.time_input(
-        "Earliest start time",
-        value=time(6, 0),
-    )
-
-    latest_finish = st.time_input(
-        "Latest finish time",
-        value=time(22, 0),
-    )
-
-    number_of_recommendations = st.slider(
-        "Number of recommendations",
-        min_value=1,
-        max_value=5,
-        value=3,
-    )
-
-
-# --------------------------------------------------
-# FETCH DATA
-# --------------------------------------------------
-
-st.subheader("Traffic database")
-
 try:
-    with st.spinner("Connecting to TigerData and loading readings..."):
-        df = load_traffic_data()
+    with st.spinner("Loading cameras and traffic readings..."):
+        sensors = load_sensors()
+        traffic = load_traffic()
 
-except Exception as e:
-    st.error("Could not load traffic data.")
+except Exception as exc:
+    st.error("Could not load data from TigerData.")
     st.write(
-        "Check your database credentials in the .env file, "
-        "your internet connection, and the database query."
+        "Check that your .env file is in the same folder as app.py "
+        "and that your database credentials are correct."
     )
-    st.exception(e)
+    with st.expander("Technical details"):
+        st.code(str(exc))
     st.stop()
 
 
-if df.empty:
-    st.warning(
-        "The database query returned no readings. "
-        "Check that public.traffic contains data and that "
-        "traffic sensor IDs match public.detectors IDs."
+if sensors.empty:
+    st.error("No cameras with valid coordinates were found.")
+    st.stop()
+
+sensors["sensor_id"] = pd.to_numeric(
+    sensors["sensor_id"], errors="coerce"
+)
+traffic["sensor_id"] = pd.to_numeric(
+    traffic["sensor_id"], errors="coerce"
+)
+
+sensors = sensors.dropna(
+    subset=["sensor_id", "latitude", "longitude"]
+).copy()
+
+sensors["sensor_id"] = sensors["sensor_id"].astype(int)
+traffic = traffic.dropna(subset=["sensor_id"]).copy()
+traffic["sensor_id"] = traffic["sensor_id"].astype(int)
+
+# Calculate each camera's latest reading once, not inside the map loop.
+if not traffic.empty:
+    latest_by_sensor = (
+        traffic.sort_values("reading_time")
+        .drop_duplicates("sensor_id", keep="last")
+        .set_index("sensor_id")
     )
-    st.stop()
+else:
+    latest_by_sensor = pd.DataFrame()
 
-
-df["reading_time"] = pd.to_datetime(
-    df["reading_time"], errors="coerce"
-)
-
-df["vehicles"] = pd.to_numeric(
-    df["vehicles"], errors="coerce"
-)
-
-df = df.dropna(
-    subset=["reading_time", "vehicles", "sensor_id"]
-)
-
-if df.empty:
-    st.warning("No valid traffic readings were returned.")
-    st.stop()
-
+sensor_ids = set(sensors["sensor_id"].tolist())
+traffic_ids = set(traffic["sensor_id"].tolist())
 
 # --------------------------------------------------
-# OVERVIEW
+# SMALL STATUS LINE
 # --------------------------------------------------
 
-first_reading = df["reading_time"].min()
-latest_reading = df["reading_time"].max()
+m1, m2, m3 = st.columns(3)
 
-col1, col2, col3 = st.columns(3)
+m1.metric("Available cameras", f"{len(sensors):,}")
+m2.metric("Loaded traffic readings", f"{len(traffic):,}")
 
-col1.metric(
-    "Sensors",
-    df["sensor_id"].nunique(),
-)
-
-col2.metric(
-    "Traffic readings loaded",
-    f"{len(df):,}",
-)
-
-col3.metric(
-    "Average vehicles per reading",
-    f"{df['vehicles'].mean():.1f}",
-)
-
-st.caption(
-    f"Loaded data range: {first_reading:%d %b %Y %H:%M} "
-    f"to {latest_reading:%d %b %Y %H:%M}. "
-    "The database may contain older readings beyond this sample."
-)
-
+if not traffic.empty:
+    latest_timestamp = traffic["reading_time"].max()
+    m3.metric(
+        "Latest timestamp in loaded data",
+        latest_timestamp.strftime("%d %b %Y, %H:%M"),
+    )
+else:
+    m3.metric("Traffic readings", "None found")
 
 # --------------------------------------------------
-# SELECT SENSOR
+# INTERACTIVE MAP
 # --------------------------------------------------
 
-st.header("1. Select a road location")
-
-sensors = (
-    df[
-        [
-            "sensor_id",
-            "sensor_name",
-            "district",
-            "latitude",
-            "longitude",
-        ]
-    ]
-    .drop_duplicates(subset=["sensor_id"])
-    .sort_values("sensor_id")
-    .copy()
+st.subheader("1. Select a traffic camera")
+st.write(
+    "Click a camera marker on the map, or select a camera using "
+    "the searchable dropdown below."
 )
 
-sensors["label"] = sensors.apply(
-    lambda row: (
-        f"{row['sensor_name']} "
-        f"(Sensor {row['sensor_id']}, District {row['district']})"
-    ),
-    axis=1,
+map_center = [
+    float(sensors["latitude"].mean()),
+    float(sensors["longitude"].mean()),
+]
+
+traffic_map = folium.Map(
+    location=map_center,
+    zoom_start=11,
+    tiles="OpenStreetMap",
+    control_scale=True,
 )
 
-selected_label = st.selectbox(
-    "Choose a traffic sensor",
-    sensors["label"].tolist(),
+cluster = MarkerCluster(
+    name="Traffic cameras",
+    options={"showCoverageOnHover": False},
+).add_to(traffic_map)
+
+for row in sensors.itertuples(index=False):
+    sid = int(row.sensor_id)
+    name = str(row.sensor_name)
+    district = str(row.district or "Unknown")
+
+    if sid in latest_by_sensor.index:
+        reading = latest_by_sensor.loc[sid]
+        latest_count = reading["vehicles"]
+        latest_time = reading["reading_time"]
+
+        count_text = (
+            f"{latest_count:.0f}"
+            if pd.notna(latest_count)
+            else "Unavailable"
+        )
+        time_text = latest_time.strftime("%d %b %Y %H:%M")
+        marker_colour = "green"
+    else:
+        count_text = "Unavailable"
+        time_text = "No loaded reading"
+        marker_colour = "gray"
+
+    popup_html = (
+        f"<b>{name}</b><br>"
+        f"Camera ID: {sid}<br>"
+        f"District: {district}<br>"
+        f"Latitude: {float(row.latitude):.6f}<br>"
+        f"Longitude: {float(row.longitude):.6f}<br>"
+        f"Latest recorded vehicle count: {count_text}<br>"
+        f"Reading time: {time_text}"
+    )
+
+    folium.Marker(
+        location=[float(row.latitude), float(row.longitude)],
+        tooltip=f"Camera ID: {sid}",
+        popup=folium.Popup(popup_html, max_width=320),
+        icon=folium.Icon(
+            color=marker_colour,
+            icon="camera",
+            prefix="fa",
+        ),
+    ).add_to(cluster)
+
+map_result = st_folium(
+    traffic_map,
+    height=560,
+    use_container_width=True,
+    returned_objects=["last_object_clicked_tooltip"],
+    key="roadworkwise_main_map",
 )
 
-selected_sensor = sensors[
-    sensors["label"] == selected_label
+# Keep the selected camera after Streamlit reruns.
+if "selected_sensor_id" not in st.session_state:
+    st.session_state["selected_sensor_id"] = int(
+        sensors.iloc[0]["sensor_id"]
+    )
+
+tooltip = (map_result or {}).get("last_object_clicked_tooltip")
+
+if tooltip:
+    try:
+        clicked_id = int(tooltip.split("Camera ID:")[-1].strip())
+        if clicked_id in sensor_ids:
+            st.session_state["selected_sensor_id"] = clicked_id
+    except (ValueError, TypeError):
+        pass
+
+sensor_labels = {
+    int(row.sensor_id): (
+        f"{row.sensor_name} | ID {int(row.sensor_id)} "
+        f"| {row.district or 'Unknown district'}"
+    )
+    for row in sensors.itertuples(index=False)
+}
+
+current_id = st.session_state["selected_sensor_id"]
+if current_id not in sensor_labels:
+    current_id = int(sensors.iloc[0]["sensor_id"])
+
+selected_id = st.selectbox(
+    "Search or choose a camera",
+    options=list(sensor_labels.keys()),
+    index=list(sensor_labels.keys()).index(current_id),
+    format_func=lambda sid: sensor_labels[sid],
+    key="camera_dropdown",
+)
+
+st.session_state["selected_sensor_id"] = selected_id
+
+selected_sensor = sensors.loc[
+    sensors["sensor_id"] == selected_id
 ].iloc[0]
 
-sensor_id = selected_sensor["sensor_id"]
-
-sensor_df = df[
-    df["sensor_id"] == sensor_id
+sensor_traffic = traffic.loc[
+    traffic["sensor_id"] == selected_id
 ].copy()
 
-col1, col2, col3 = st.columns(3)
-
-col1.write(f"**Sensor:** {selected_sensor['sensor_name']}")
-col2.write(f"**District:** {selected_sensor['district']}")
-col3.write(
-    f"**Coordinates:** "
-    f"{selected_sensor['latitude']}, "
-    f"{selected_sensor['longitude']}"
-)
-
-
 # --------------------------------------------------
-# HISTORICAL TRAFFIC CHART
+# SELECTED CAMERA DETAILS
 # --------------------------------------------------
 
-st.header("2. Historical traffic patterns")
+st.divider()
+st.subheader("2. Camera details")
 
-sensor_df["time_slot"] = (
-    sensor_df["reading_time"].dt.hour * 60
-    + sensor_df["reading_time"].dt.minute
-) // 15
+d1, d2, d3 = st.columns(3)
 
-average_traffic = (
-    sensor_df.groupby("time_slot")["vehicles"]
-    .mean()
-    .reset_index()
+d1.metric("Camera", str(selected_sensor["sensor_name"]))
+d2.metric("Camera ID", str(selected_id))
+d3.metric(
+    "District",
+    str(selected_sensor["district"] or "Unknown"),
 )
 
-average_traffic["Time"] = average_traffic["time_slot"].apply(
-    lambda slot: (
-        f"{int(slot * 15 // 60):02d}:"
-        f"{int(slot * 15 % 60):02d}"
+coord1, coord2 = st.columns(2)
+coord1.write(f"**Latitude:** {selected_sensor['latitude']}")
+coord2.write(f"**Longitude:** {selected_sensor['longitude']}")
+
+if not sensor_traffic.empty:
+    sensor_traffic = sensor_traffic.sort_values("reading_time")
+    last_reading = sensor_traffic.iloc[-1]
+
+    r1, r2 = st.columns(2)
+    r1.metric(
+        "Latest recorded vehicle count",
+        f"{last_reading['vehicles']:.0f}",
     )
-)
-
-if not average_traffic.empty:
-    st.line_chart(
-        average_traffic.set_index("Time")[["vehicles"]]
+    r2.metric(
+        "Reading timestamp",
+        last_reading["reading_time"].strftime("%d %b %Y, %H:%M"),
     )
 
-st.caption(
-    "Average recorded vehicles in each 15-minute time slot, "
-    "using the readings currently loaded."
-)
-
+    with st.expander("View historical traffic at this camera"):
+        chart_data = sensor_traffic.set_index("reading_time")[
+            ["vehicles"]
+        ].rename(columns={"vehicles": "Recorded vehicles"})
+        st.line_chart(chart_data)
+        st.caption(
+            "The chart shows recorded vehicle counts, not live traffic."
+        )
+else:
+    st.warning(
+        "No traffic readings for this camera were found in the "
+        "100,000 readings loaded by this app. Try another camera."
+    )
 
 # --------------------------------------------------
-# FIND QUIETER WINDOWS
+# ROADWORKS SCHEDULER
 # --------------------------------------------------
 
-st.header("3. Recommended roadworks windows")
+st.divider()
+st.subheader("3. Plan your roadworks")
 
-if earliest_start >= latest_finish:
-    st.error(
-        "The earliest start time must be before the latest finish time."
-    )
-    st.stop()
+st.write(
+    "Choose how long the work will take and the time range in which "
+    "it is permitted to start and finish."
+)
 
-
-if st.button("Find quieter time windows", type="primary"):
-
-    slot_minutes = 15
-
-    # Round duration up to a whole number of 15-minute slots.
-    slots_needed = max(
-        1,
-        (duration + slot_minutes - 1) // slot_minutes,
-    )
-
-    start_minute = (
-        earliest_start.hour * 60 + earliest_start.minute
+with st.form("roadworks_form"):
+    duration_hours = st.selectbox(
+        "Roadworks duration",
+        options=[0.5, 1, 1.5, 2, 3, 4, 6, 8, 12],
+        index=3,
+        format_func=lambda x: (
+            f"{x:g} hour" if x == 1 else f"{x:g} hours"
+        ),
     )
 
-    finish_minute = (
-        latest_finish.hour * 60 + latest_finish.minute
-    )
+    start_col, end_col = st.columns(2)
 
-    # Historical mean vehicle count for each daily time slot.
-    slot_traffic = (
-        sensor_df.groupby("time_slot")["vehicles"]
-        .mean()
-        .to_dict()
-    )
-
-    candidates = []
-
-    first_slot = (start_minute + 14) // 15
-    last_slot = finish_minute // 15
-
-    for start_slot in range(first_slot, last_slot):
-        end_slot = start_slot + slots_needed
-
-        if end_slot * 15 > finish_minute:
-            continue
-
-        window_slots = list(
-            range(start_slot, end_slot)
+    with start_col:
+        earliest_start = st.time_input(
+            "Earliest permitted start",
+            value=time(6, 0),
+            step=900,
         )
 
-        # Only rank windows with data for every slot.
-        if not all(
-            slot in slot_traffic
-            for slot in window_slots
-        ):
-            continue
-
-        traffic_score = sum(
-            slot_traffic[slot]
-            for slot in window_slots
+    with end_col:
+        latest_finish = st.time_input(
+            "Latest permitted finish",
+            value=time(22, 0),
+            step=900,
         )
 
-        candidates.append({
-            "start_slot": start_slot,
-            "end_slot": end_slot,
-            "traffic_score": traffic_score,
-            "average_vehicles": (
-                traffic_score / slots_needed
-            ),
+    selected_weekday = st.selectbox(
+        "Day of week",
+        options=[
+            "Any day",
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+            "Sunday",
+        ],
+    )
+
+    submitted = st.form_submit_button(
+        "Find the best time",
+        type="primary",
+        use_container_width=True,
+    )
+
+# --------------------------------------------------
+# RECOMMENDATION ENGINE
+# --------------------------------------------------
+
+def minutes_since_midnight(value):
+    return value.hour * 60 + value.minute
+
+
+def calculate_recommendations(
+    df,
+    duration_hours,
+    earliest,
+    latest,
+    weekday,
+):
+    """
+    Score candidate windows using historical average vehicle counts.
+    Each historical date contributes its average count for the window.
+    """
+    if df.empty:
+        return pd.DataFrame(), "No historical readings are available."
+
+    duration_minutes = int(round(duration_hours * 60))
+    earliest_minutes = minutes_since_midnight(earliest)
+    latest_minutes = minutes_since_midnight(latest)
+
+    if latest_minutes <= earliest_minutes:
+        return (
+            pd.DataFrame(),
+            "The permitted finish time must be later than the "
+            "earliest start time. Overnight scheduling is not "
+            "supported in this version.",
+        )
+
+    if earliest_minutes + duration_minutes > latest_minutes:
+        return (
+            pd.DataFrame(),
+            "The roadworks duration does not fit inside the permitted "
+            "time range.",
+        )
+
+    work = df.copy()
+    work["date_only"] = work["reading_time"].dt.date
+    work["minute_of_day"] = (
+        work["reading_time"].dt.hour * 60
+        + work["reading_time"].dt.minute
+    )
+
+    if weekday != "Any day":
+        weekday_number = [
+            "Monday", "Tuesday", "Wednesday", "Thursday",
+            "Friday", "Saturday", "Sunday",
+        ].index(weekday)
+
+        work = work[
+            work["reading_time"].dt.dayofweek == weekday_number
+        ]
+
+    if work.empty:
+        return (
+            pd.DataFrame(),
+            "There are no loaded readings for the selected day. "
+            "Try Any day or select another camera.",
+        )
+
+    # Score starts every 15 minutes.
+    results = []
+
+    last_start = latest_minutes - duration_minutes
+
+    for start_minute in range(
+        earliest_minutes,
+        last_start + 1,
+        15,
+    ):
+        end_minute = start_minute + duration_minutes
+
+        window_rows = work[
+            (work["minute_of_day"] >= start_minute)
+            & (work["minute_of_day"] < end_minute)
+        ]
+
+        if window_rows.empty:
+            continue
+
+        # Average within each date first, then across dates.
+        per_day = window_rows.groupby("date_only")["vehicles"].mean()
+        if per_day.empty:
+            continue
+
+        results.append({
+            "start": start_minute,
+            "end": end_minute,
+            "average_vehicles": float(per_day.mean()),
+            "days_sampled": int(per_day.count()),
+            "sample_readings": int(len(window_rows)),
         })
 
-    candidates.sort(
-        key=lambda item: item["traffic_score"]
+    if not results:
+        return (
+            pd.DataFrame(),
+            "There is not enough historical data to score suitable "
+            "windows for these settings.",
+        )
+
+    ranked = pd.DataFrame(results).sort_values(
+        "average_vehicles"
     )
 
-    recommendations = []
+    # Choose up to three windows that do not overlap.
+    chosen = []
 
-    for candidate in candidates:
+    for candidate in ranked.to_dict("records"):
         overlaps = any(
-            candidate["start_slot"] < existing["end_slot"]
-            and candidate["end_slot"] > existing["start_slot"]
-            for existing in recommendations
+            candidate["start"] < existing["end"]
+            and candidate["end"] > existing["start"]
+            for existing in chosen
         )
 
         if not overlaps:
-            recommendations.append(candidate)
+            chosen.append(candidate)
 
-        if len(recommendations) >= number_of_recommendations:
+        if len(chosen) == 3:
             break
 
-    if not recommendations:
-        st.warning(
-            "No suitable windows found. Try a shorter duration "
-            "or a wider time range. This sensor needs historical "
-            "readings throughout the proposed windows."
-        )
+    return pd.DataFrame(chosen), None
+
+
+def format_clock(minutes):
+    minutes = int(minutes) % (24 * 60)
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+if submitted:
+    recommendations, error = calculate_recommendations(
+        sensor_traffic,
+        duration_hours,
+        earliest_start,
+        latest_finish,
+        selected_weekday,
+    )
+
+    st.divider()
+    st.subheader("4. Recommended roadworks windows")
+
+    if error:
+        st.warning(error)
+
+    elif recommendations.empty:
+        st.warning("No suitable windows could be calculated.")
 
     else:
-        for rank, recommendation in enumerate(
-            recommendations, start=1
-        ):
-            start = recommendation["start_slot"] * 15
-            end = recommendation["end_slot"] * 15
-
-            start_text = (
-                f"{start // 60:02d}:{start % 60:02d}"
-            )
-            end_text = (
-                f"{end // 60:02d}:{end % 60:02d}"
-            )
-
-            st.subheader(
-                f"Option {rank}: {start_text} – {end_text}"
-            )
-
-            st.write(
-                f"**Average vehicles per 15-minute slot:** "
-                f"{recommendation['average_vehicles']:.1f}"
-            )
-
-            st.write(
-                f"**Estimated duration:** "
-                f"{slots_needed * 15} minutes"
-            )
-
-        st.info(
-            "These options are ranked using historical vehicle counts. "
-            "They estimate traffic volume, not actual delays or queues, "
-            "and historical patterns cannot guarantee future conditions."
+        st.success(
+            "Ranked from lowest to highest historical average "
+            "vehicle count among the available time windows."
         )
 
+        for rank, result in enumerate(
+            recommendations.to_dict("records"),
+            start=1,
+        ):
+            with st.container(border=True):
+                left, right = st.columns([3, 1])
+
+                with left:
+                    st.markdown(f"### {rank}. {format_clock(result['start'])}–{format_clock(result['end'])}")
+                    st.write(
+                        f"Historical average: "
+                        f"**{result['average_vehicles']:.1f} vehicles "
+                        f"per recorded interval**"
+                    )
+                    st.caption(
+                        f"Based on {result['days_sampled']} historical "
+                        f"date(s) and {result['sample_readings']} "
+                        f"readings in this window."
+                    )
+
+                with right:
+                    if rank == 1:
+                        st.markdown("**Best-ranked option**")
+                    else:
+                        st.markdown(f"Alternative {rank - 1}")
+
+        st.info(
+            "These recommendations use historical readings loaded by "
+            "the app. They are estimates of traffic volume, not a "
+            "prediction of live congestion, queues, or roadworks delays."
+        )
+
+        export_df = recommendations.copy()
+        export_df["start_time"] = export_df["start"].apply(format_clock)
+        export_df["finish_time"] = export_df["end"].apply(format_clock)
+        export_df["camera_id"] = selected_id
+        export_df["camera_name"] = str(selected_sensor["sensor_name"])
+        export_df["latitude"] = float(selected_sensor["latitude"])
+        export_df["longitude"] = float(selected_sensor["longitude"])
+        export_df["duration_hours"] = duration_hours
+
+        export_columns = [
+            "camera_name",
+            "camera_id",
+            "latitude",
+            "longitude",
+            "duration_hours",
+            "start_time",
+            "finish_time",
+            "average_vehicles",
+            "days_sampled",
+            "sample_readings",
+        ]
+
+        st.download_button(
+            "Download recommendations as CSV",
+            data=export_df[export_columns].to_csv(index=False),
+            file_name="roadworkwise_recommendations.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
 # --------------------------------------------------
-# VIEW READINGS
+# FOOTER
 # --------------------------------------------------
 
-with st.expander("View recent traffic readings"):
-    st.dataframe(
-        sensor_df.sort_values(
-            "reading_time", ascending=False
-        ).head(100),
-        use_container_width=True,
-    )
+st.divider()
+st.caption(
+    "RoadworkWise is a planning aid. Check local restrictions, "
+    "permits, safety requirements and current road conditions before "
+    "scheduling roadworks."
+)
