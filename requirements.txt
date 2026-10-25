@@ -1,4 +1,7 @@
 streamlit
+streamlit-folium
+folium
+altair
 pandas
 plotly
 asyncpg
@@ -6,4 +9,3 @@ python-dotenv
 snowflake-connector-python
 google-genai
 elevenlabs
-folium
