@@ -16,6 +16,8 @@ from dotenv import load_dotenv
 from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
 
+from aura_widget import render_aura_widget
+
 load_dotenv()
 
 st.set_page_config(
@@ -39,6 +41,15 @@ st.markdown(
 )
 
 st.title("RoadWork AI")
+
+# AURA floating voice assistant (bottom-right bubble).
+# Must stay ABOVE any st.stop() so it shows on every screen.
+def _aura_context():
+    cam = st.session_state.get("selected_camera")
+    return f"The user has camera/sensor ID {cam} selected on the map." if cam else ""
+
+
+render_aura_widget(_aura_context)
 
 # --------------------------------------------------
 # DATABASE
@@ -65,9 +76,17 @@ async def query_database(sql, *args):
         await conn.close()
 
 
+def run_db(coro):
+    """Run a database query in its own thread + event loop (same way as db_check.py),
+    so it never clashes with Streamlit's own event loop."""
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_sensors():
-    rows = asyncio.run(query_database("""
+    rows = run_db(query_database("""
         SELECT
             id AS sensor_id,
             name AS "Name",
@@ -92,57 +111,52 @@ def load_sensors():
     )
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def load_traffic():
-    rows = asyncio.run(query_database("""
+def _clean_traffic(rows):
+    df = pd.DataFrame(
+        [dict(row) for row in rows],
+        columns=["Hour", "sensor_id", "Vehicle Count"],
+    )
+    if not df.empty:
+        df["Hour"] = pd.to_datetime(df["Hour"], errors="coerce")
+        df["Vehicle Count"] = pd.to_numeric(df["Vehicle Count"], errors="coerce")
+        df["sensor_id"] = pd.to_numeric(df["sensor_id"], errors="coerce")
+        df = df.dropna(subset=["Hour", "Vehicle Count", "sensor_id"]).copy()
+        df["sensor_id"] = df["sensor_id"].astype(int)
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_camera_traffic(sensor_id):
+    """Only the readings of ONE camera (thousands of rows, not millions)."""
+    rows = run_db(query_database("""
         SELECT
             date AS "Hour",
             id AS sensor_id,
             vehicles AS "Vehicle Count"
         FROM public.traffic
-        WHERE date IS NOT NULL
+        WHERE id = $1
+          AND date IS NOT NULL
           AND vehicles IS NOT NULL
-        ORDER BY id, date
-    """))
+        ORDER BY date
+    """, int(sensor_id)))
+    return _clean_traffic(rows)
 
-    df = pd.DataFrame(
-        [dict(row) for row in rows],
-        columns=["Hour", "sensor_id", "Vehicle Count"],
-    )
 
-    if not df.empty:
-        df["Hour"] = pd.to_datetime(
-            df["Hour"], errors="coerce"
-        )
-        df["Vehicle Count"] = pd.to_numeric(
-            df["Vehicle Count"], errors="coerce"
-        )
-        df["sensor_id"] = pd.to_numeric(
-            df["sensor_id"], errors="coerce"
-        )
-
-        df = df.dropna(
-            subset=["Hour", "Vehicle Count", "sensor_id"]
-        ).copy()
-
-        df["sensor_id"] = df["sensor_id"].astype(int)
-
-    return df
+def show_db_error(exc):
+    st.error("Could not load data from the traffic database.")
+    with st.expander("Technical details"):
+        st.code(f"{type(exc).__name__}: {exc!r}")
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+            st.caption("The database took too long to answer. Check your internet connection "
+                       "and that the Tiger Data service is running, then press R to retry.")
 
 
 try:
-    with st.spinner(
-        "Loading camera locations and historical traffic data..."
-    ):
+    with st.spinner("Loading camera locations..."):
         sensors = load_sensors()
-        traffic = load_traffic()
 
 except Exception as exc:
-    st.error("Could not load data from the traffic database.")
-
-    with st.expander("Technical details"):
-        st.code(str(exc))
-
+    show_db_error(exc)
     st.stop()
 
 
@@ -165,10 +179,6 @@ sensors = sensors.dropna(
 ).copy()
 
 sensors["sensor_id"] = sensors["sensor_id"].astype(int)
-
-if traffic.empty:
-    st.warning("No historical traffic readings were returned.")
-    st.stop()
 
 
 # --------------------------------------------------
@@ -264,9 +274,13 @@ if camera_matches.empty:
 
 camera = camera_matches.iloc[0]
 
-camera_data = traffic.loc[
-    traffic["sensor_id"] == selected_id
-].copy()
+try:
+    with st.spinner("Loading this camera's traffic history..."):
+        camera_data = load_camera_traffic(selected_id).copy()
+except Exception as exc:
+    show_db_error(exc)
+    st.stop()
+
 
 st.divider()
 
@@ -384,6 +398,7 @@ chart = (
 )
 
 st.altair_chart(chart, use_container_width=True)
+
 
 
 # --------------------------------------------------
