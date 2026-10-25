@@ -6,3 +6,4 @@ python-dotenv
 snowflake-connector-python
 google-genai
 elevenlabs
+folium
