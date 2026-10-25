@@ -19,7 +19,7 @@ from streamlit_folium import st_folium
 load_dotenv()
 
 st.set_page_config(
-    page_title="RoadworkWise",
+    page_title="Roadwork AI",
     page_icon="🚧",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -38,12 +38,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("RoadworkWise")
-st.caption(
-    "Forecast traffic demand, check weather conditions "
-    "and find a more efficient time for roadworks."
-)
-
+st.title("RoadWork AI")
 
 # --------------------------------------------------
 # DATABASE
@@ -180,8 +175,6 @@ if traffic.empty:
 # CAMERA MAP
 # --------------------------------------------------
 
-st.subheader("Traffic camera map")
-st.write("Click a camera marker on the map to select it.")
 
 traffic_map = folium.Map(
     location=[
@@ -339,10 +332,6 @@ daily["time"] = daily["slot"].apply(
 
 st.subheader("Historical traffic patterns")
 
-st.write(
-    "Explore the average recorded vehicle count for each "
-    "15-minute period across the available historical data."
-)
 
 chart = (
     alt.Chart(daily)
@@ -589,12 +578,7 @@ st.divider()
 
 st.subheader("Plan your roadworks")
 
-st.write(
-    "Choose a date, duration and permitted working hours. "
-    "RoadworkWise estimates traffic demand from historical "
-    "patterns and checks the weather forecast before ranking "
-    "possible work windows."
-)
+
 
 with st.form("roadworks_schedule"):
     planned_date = st.date_input(
@@ -912,24 +896,10 @@ if find_best:
             "%A %d %B %Y"
         )
 
-    st.caption(
-        f"Demand estimate for {date_description}, based "
-        f"on historical readings from {sample_days} "
-        f"distinct day(s)."
-    )
+    
 
     if weather is not None:
-        st.success(
-            "Recommendations combine estimated traffic "
-            "demand (80%) and a weather planning indicator (20%)."
-        )
-
-        st.caption(
-            "The weather weighting is a configurable heuristic, "
-            "not a validated prediction of roadwork safety "
-            "or traffic impact."
-        )
-
+        
         st.caption(
             "Weather source: Open-Meteo hourly forecast."
         )
